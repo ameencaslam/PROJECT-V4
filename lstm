@@ -1,0 +1,454 @@
+#pip install 
+import torch
+import torchvision
+from torchvision import transforms, models
+from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sn
+import face_recognition
+import glob
+import random
+import sys
+from sklearn.metrics import confusion_matrix
+import os
+from tqdm import tqdm
+from torchvision.models import efficientnet_v2_s
+import torch.nn.functional as F
+
+# Dataset class
+class VideoDataset(Dataset):
+    def __init__(self, video_names, labels, sequence_length=40, transform=None):
+        self.video_names = []
+        self.labels = labels
+        self.transform = transform
+        self.count = sequence_length
+        
+        # Filter out videos that don't have metadata
+        for video_path in video_names:
+            video_name = os.path.basename(video_path)
+            if not self.labels.loc[self.labels["file"] == video_name].empty:
+                self.video_names.append(video_path)
+            
+        print(f"Found metadata for {len(self.video_names)} out of {len(video_names)} videos")
+        if len(self.video_names) == 0:
+            raise ValueError("No valid videos found with corresponding metadata")
+
+    def __len__(self):
+        return len(self.video_names)
+
+    def __getitem__(self, idx):
+        video_path = self.video_names[idx]
+        frames = []
+        temp_video = os.path.basename(video_path)
+        
+        # Get label
+        label_row = self.labels.loc[self.labels["file"] == temp_video]
+        if label_row.empty:
+            raise ValueError(f"No metadata found for video: {temp_video}")
+            
+        label = label_row.iloc[0,1]
+        label = 0 if label == 'FAKE' else 1
+
+        # Extract frames
+        for i, frame in enumerate(self.frame_extract(video_path)):
+            if frame is None:
+                continue
+            try:
+                if self.transform:
+                    frame = self.transform(frame)
+                frames.append(frame)
+                if len(frames) == self.count:
+                    break
+            except Exception as e:
+                print(f"Error processing frame {i} from video {temp_video}: {str(e)}")
+                continue
+                
+        if len(frames) == 0:
+            raise ValueError(f"No valid frames extracted from video: {temp_video}")
+            
+        frames = torch.stack(frames)
+        frames = frames[:self.count]
+        return frames, label
+
+    def frame_extract(self, path):
+        try:
+            vidObj = cv2.VideoCapture(path)
+            if not vidObj.isOpened():
+                print(f"Could not open video file: {path}")
+                return
+                
+            success = True
+            while success:
+                success, image = vidObj.read()
+                if success:
+                    yield image
+        except Exception as e:
+            print(f"Error reading video {path}: {str(e)}")
+        finally:
+            vidObj.release()
+
+# Model class
+class MultiScaleAttention(nn.Module):
+    def __init__(self, in_channels, reduction=8):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        return x * self.attention(x)
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, dim, num_heads=8, num_layers=3):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=num_heads,
+            dim_feedforward=dim*4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+    def forward(self, x):
+        return self.transformer(x)
+
+class Model(nn.Module):
+    def __init__(self, num_classes=2, hidden_dim=1280):
+        super(Model, self).__init__()
+        
+        # Load EfficientNetV2-S as the CNN backbone
+        self.backbone = efficientnet_v2_s(weights='IMAGENET1K_V1')
+        
+        # Remove the classification head
+        self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+        
+        # LSTM for temporal modeling
+        self.lstm_hidden_dim = hidden_dim
+        self.lstm = nn.LSTM(
+            input_size=1280,  # EfficientNetV2-S output features
+            hidden_size=self.lstm_hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.5
+        )
+        
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(self.lstm_hidden_dim * 2, hidden_dim),  # *2 for bidirectional
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.5),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, seq_length, c, h, w = x.shape
+        
+        # Process each frame through CNN
+        cnn_features = []
+        for t in range(seq_length):
+            # Extract features for current frame
+            frame = x[:, t, :, :, :]
+            features = self.backbone(frame)
+            features = features.view(batch_size, -1)  # Flatten
+            cnn_features.append(features)
+        
+        # Stack frame features
+        cnn_features = torch.stack(cnn_features, dim=1)
+        
+        # Process through LSTM
+        lstm_out, (hidden, cell) = self.lstm(cnn_features)
+        
+        # Use the last output from the LSTM
+        lstm_last_output = lstm_out[:, -1, :]
+        
+        # Classification
+        output = self.classifier(lstm_last_output)
+        
+        return None, output  # Keep None for compatibility with existing code
+
+# Training utilities
+class AverageMeter(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def calculate_accuracy(outputs, targets):
+    batch_size = targets.size(0)
+    _, pred = outputs.topk(1, 1, True)
+    pred = pred.t()
+    correct = pred.eq(targets.view(1, -1))
+    n_correct_elems = correct.float().sum().item()
+    return 100 * n_correct_elems / batch_size
+
+def train_epoch(epoch, num_epochs, data_loader, model, criterion, optimizer):
+    model.train()
+    losses = AverageMeter()
+    accuracies = AverageMeter()
+    
+    progress_bar = tqdm(data_loader, desc=f'Epoch {epoch}/{num_epochs}')
+    for i, (inputs, targets) in enumerate(progress_bar):
+        if torch.cuda.is_available():
+            targets = targets.type(torch.cuda.LongTensor)
+            inputs = inputs.cuda()
+            
+        _, outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        acc = calculate_accuracy(outputs, targets)
+        
+        losses.update(loss.item(), inputs.size(0))
+        accuracies.update(acc, inputs.size(0))
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Update progress bar
+        progress_bar.set_postfix({
+            'Loss': f'{losses.avg:.4f}',
+            'Acc': f'{accuracies.avg:.2f}%'
+        })
+    
+    return losses.avg, accuracies.avg
+
+def test(epoch, model, data_loader, criterion):
+    print('\nTesting')
+    model.eval()
+    losses = AverageMeter()
+    accuracies = AverageMeter()
+    pred = []
+    true = []
+    
+    progress_bar = tqdm(data_loader, desc='Testing')
+    with torch.no_grad():
+        for inputs, targets in progress_bar:
+            if torch.cuda.is_available():
+                targets = targets.cuda()
+                inputs = inputs.cuda()
+                
+            _, outputs = model(inputs)
+            loss = criterion(outputs, targets.type(torch.cuda.LongTensor))
+            acc = calculate_accuracy(outputs, targets.type(torch.cuda.LongTensor))
+            
+            _, p = torch.max(outputs, 1)
+            true += targets.type(torch.cuda.LongTensor).cpu().numpy().tolist()
+            pred += p.cpu().numpy().tolist()
+            
+            losses.update(loss.item(), inputs.size(0))
+            accuracies.update(acc, inputs.size(0))
+            
+            progress_bar.set_postfix({
+                'Loss': f'{losses.avg:.4f}',
+                'Acc': f'{accuracies.avg:.2f}%'
+            })
+            
+    return true, pred, losses.avg, accuracies.avg
+
+def plot_metrics(train_loss, train_acc, test_loss, test_acc):
+    """Plot training metrics"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Plot loss
+    ax1.plot(train_loss, label='Training Loss')
+    ax1.plot(test_loss, label='Validation Loss')
+    ax1.set_title('Loss vs Epochs')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    
+    # Plot accuracy
+    ax2.plot(train_acc, label='Training Accuracy')
+    ax2.plot(test_acc, label='Validation Accuracy')
+    ax2.set_title('Accuracy vs Epochs')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_metrics.png')
+    plt.close()
+
+def main():
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Kaggle paths
+    BASE_PATH = '/kaggle/input/dfdsv1/dataset'  # Base dataset directory
+    DATA_PATH = {
+        'CELEB_FAKE': os.path.join(BASE_PATH, 'Celeb_fake_face_only'),
+        'CELEB_REAL': os.path.join(BASE_PATH, 'Celeb_real_face_only'),
+        'DFDC_FAKE': os.path.join(BASE_PATH, 'DFDC_FAKE_Face_only_data'),
+        'DFDC_REAL': os.path.join(BASE_PATH, 'DFDC_REAL_Face_only_data'),
+        'FF': os.path.join(BASE_PATH, 'FF_Face_only_data'),
+        'METADATA': os.path.join(BASE_PATH, 'Gobal_metadata.csv')  # Path to metadata file
+    }
+    OUTPUT_PATH = './'
+    
+    # Verify metadata file exists
+    if not os.path.exists(DATA_PATH['METADATA']):
+        raise FileNotFoundError(f"Metadata file not found at {DATA_PATH['METADATA']}")
+    
+    # Data preparation
+    video_files = []
+    for dataset_dir in [DATA_PATH['CELEB_FAKE'], DATA_PATH['CELEB_REAL'], 
+ 
+                       DATA_PATH['FF']]:
+        if os.path.exists(dataset_dir):
+            video_files.extend(glob.glob(os.path.join(dataset_dir, '*.mp4')))
+        else:
+            print(f"Warning: Directory not found: {dataset_dir}")
+    
+    print(f"Total videos found: {len(video_files)}")
+    if len(video_files) == 0:
+        raise ValueError("No video files found in the specified directories")
+    
+    random.shuffle(video_files)
+    
+    # Add back the train-test split
+    train_videos = video_files[:int(0.8*len(video_files))]
+    valid_videos = video_files[int(0.8*len(video_files)):]
+    
+    print(f"Training videos: {len(train_videos)}")
+    print(f"Validation videos: {len(valid_videos)}")
+    
+    # Load labels with error handling
+    try:
+        labels = pd.read_csv(DATA_PATH['METADATA'], names=["file", "label"])
+        print(f"Loaded metadata file with {len(labels)} entries")
+        
+        # Verify label format
+        invalid_labels = labels[~labels['label'].isin(['FAKE', 'REAL'])]
+        if not invalid_labels.empty:
+            print(f"Warning: Found {len(invalid_labels)} invalid labels:")
+            print(invalid_labels)
+            
+        # Remove any duplicate entries
+        duplicates = labels[labels.duplicated(['file'], keep=False)]
+        if not duplicates.empty:
+            print(f"Warning: Found {len(duplicates)} duplicate entries:")
+            print(duplicates)
+            labels = labels.drop_duplicates(['file'], keep='first')
+            
+    except Exception as e:
+        raise Exception(f"Error loading metadata file: {str(e)}")
+    
+    # Define transforms
+    im_size = 112
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    
+    train_transforms = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),  # EfficientNetV2 prefers larger input size
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Create datasets with error handling
+    try:
+        train_data = VideoDataset(train_videos, labels, sequence_length=10, transform=train_transforms)
+        val_data = VideoDataset(valid_videos, labels, sequence_length=10, transform=train_transforms)
+    except Exception as e:
+        raise Exception(f"Error creating datasets: {str(e)}")
+        
+    # Verify datasets are not empty
+    if len(train_data) == 0 or len(val_data) == 0:
+        raise ValueError("Empty dataset(s) created")
+        
+    print(f"Final dataset sizes - Training: {len(train_data)}, Validation: {len(val_data)}")
+    
+    # Create dataloaders
+    train_loader = DataLoader(train_data, batch_size=1, shuffle=True, num_workers=2)
+    valid_loader = DataLoader(val_data, batch_size=1, shuffle=False, num_workers=2)
+    
+    # Initialize model
+    model = Model(num_classes=2).to(device)
+    
+    # Training parameters
+    lr = 5e-5  # Slightly higher learning rate
+    num_epochs = 25  # Train for longer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    criterion = nn.CrossEntropyLoss().to(device)
+    
+    # Training loop
+    train_loss_avg = []
+    train_accuracy = []
+    test_loss_avg = []
+    test_accuracy = []
+    
+    best_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+    
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_acc = train_epoch(epoch, num_epochs, train_loader, model, criterion, optimizer)
+        train_loss_avg.append(train_loss)
+        train_accuracy.append(train_acc)
+        
+        true, pred, test_loss, test_acc = test(epoch, model, valid_loader, criterion)
+        test_loss_avg.append(test_loss)
+        test_accuracy.append(test_acc)
+        
+        # Save best model based on validation loss
+        if test_loss < best_loss:
+            best_loss = test_loss
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_loss': best_loss,
+                'best_acc': test_acc,
+            }, os.path.join(OUTPUT_PATH, 'best_model.pth'))
+            print(f'New best model saved with loss: {best_loss:.4f}')
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f'Early stopping triggered after {epoch} epochs')
+            break
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Plot and save metrics
+        plot_metrics(train_loss_avg, train_accuracy, test_loss_avg, test_accuracy)
+        
+        # Save confusion matrix
+        cm = confusion_matrix(true, pred)
+        plt.figure(figsize=(10,7))
+        sn.heatmap(cm, annot=True, fmt='d')
+        plt.title(f'Confusion Matrix - Epoch {epoch}')
+        plt.savefig(os.path.join(OUTPUT_PATH, f'confusion_matrix_epoch_{epoch}.png'))
+        plt.close()
+
+if __name__ == "__main__":
+    main() 
